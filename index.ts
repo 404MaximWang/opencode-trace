@@ -1,45 +1,14 @@
 /**
- * OpenCode server plugin which captures raw LLM HTTP payloads to `~/opencode-trace`.
+ * OpenCode server plugin which captures raw LLM HTTP payloads to a configured JSONL file.
  *
- * Each trace is an interactive html file whose trailing unterminated html-comment contains
- * one json object per line. To read the logs programmatically, strip everything up to that
-  * final comment. To browse them interactively, open the html file directly in a browser.
-  *
- * The plugin loads `./viewer.js` at runtime and embeds it into each new html trace, while also
- * preferring a sibling `viewer.js` if one exists next to the saved html file.
+ * Each trace is a jsonl file with one JSON object per line.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs"
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs"
 import { createHash } from "node:crypto"
-import os from "node:os"
 import path from "node:path"
 
-const root = path.join(os.homedir(), "opencode-trace")
-const PREAMBLE = `<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        body {font-family: system-ui, -apple-system, sans-serif; margin: 0;}
-        body>details {margin-top: 1ex; padding-top: 1ex; border-top: 1px solid lightgray;}
-        details {position: relative; padding-left: 1.25em;}
-        summary {list-style: none; cursor: pointer;}
-        summary::-webkit-details-marker {display: none;}
-        summary::before {content: '▷';position: absolute;left: 0;color: #666;}
-        details[open]>summary::before {content: '▽';}
-        details>div {margin-left: 1.25em;}
-        details[open]>summary output {display: none;}
-    </style>
-    <script src="viewer.js"></script>
-    <script>
-        if (window.buildNode === undefined) {
-          // {viewer.js}
-        }
-    </script>
-</head>
-<body>
-</body>
-</html>
-${"<!" + "--"}
-`
+const root = process.env.TRACE_DIR
+const filename = process.env.TRACE_FILENAME
 
 /** Mutable global state: maps OpenCode session ids to the html logfile path for that session. */
 const files = new Map<string, string>()
@@ -49,6 +18,9 @@ const prevs = new Map<string, object>()
 
 /** Mutable global state: maps OpenCode session ids to the next per-session fetch sequence number. */
 const ids = new Map<string, number>()
+
+/** Mutable global state: tracks files already initialized by this module instance. */
+const initialized = new Set<string>()
 
 /** Mutable module state: the unpatched global fetch for this module instance, assigned inside `server()`. */
 let orig: typeof globalThis.fetch | undefined
@@ -97,33 +69,22 @@ function extractPromptFromRequestBody(v: Record<string, unknown>): string | unde
 }
 
 /**
- * Appends one row to the session logfile. If logging fails, them skips silently.
- * Session logfiles are like `~/opencode-trace/2024.6.10 15.30.45 why is the sky blue.html`
- * In the vanishingly rare case of filename collision (because a user asked two different sessions
- * the same prompt at the exact same second) then there'll be a clash, and that's the user's fault:
- * we tradeoff theoretical perfection for user convenience in the common case.
+ * Appends one row to the session logfile. If logging fails, then skips silently.
  */
-function writeNoThrow(id: string, name: string, row: Record<string, unknown>): void {
+function writeNoThrow(id: string, _name: string, row: Record<string, unknown>): void {
   try {
+    if (root === undefined || filename === undefined) return
+    if (!path.isAbsolute(root)) return
+    if (filename === "" || filename.includes("/") || filename.includes("\\")) return
     const prev = files.get(id)
-    const d = new Date()
-    const file = prev ?? path.join(
-      root,
-      `${d.getFullYear()}.${d.getMonth() + 1}.${d.getDate()} ${d.getHours()}.${d.getMinutes()}.${d.getSeconds()} ${name}.html`,
-    )
+    const file = prev ?? path.join(root, `${filename}.jsonl`)
     mkdirSync(root, { recursive: true })
-    if (!existsSync(file)) {
-      const html = PREAMBLE.replace(
-        "// {viewer.js}",
-        () => readFileSync(new URL("./viewer.js", import.meta.url), "utf8"),
-      )
-      appendFileSync(
-        file,
-        html,
-      )
+    if (!initialized.has(file)) {
+      writeFileSync(file, "")
+      initialized.add(file)
     }
     files.set(id, file)
-    appendFileSync(file, `${JSON.stringify(row).replace(/-->/g, "--\\u003e")}\n`)
+    appendFileSync(file, `${JSON.stringify(row)}\n`)
   } catch {
     // Intentionally swallow tracing I/O failures so plugin logging can't crash OpenCode.
   }
