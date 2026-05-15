@@ -1,6 +1,6 @@
 {
   "name": "@lucentia/opencode-trace",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "OpenCode plugin that saves raw JSON LLM request and response traces as JSONL",
   "license": "MIT",
   "type": "module",
