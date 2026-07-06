@@ -29,6 +29,10 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v)
 }
 
+function isArray(v: unknown): v is unknown[] {
+  return Array.isArray(v);
+}
+
 /**
  * Given a parsed LLM request body, returns the first user prompt text if one is present, e.g.
  * {input:[{role:"user",content:[{type:"input_text",text:"why is the sky blue?"}]}]}
@@ -98,7 +102,7 @@ function writeNoThrow(id: string, _name: string, row: Record<string, unknown>): 
  * The representation always has the same type as `next`.
  *
  * For changed lists, the representation is either the full new list, or, when shorter,
- * `['...', additions, '---', removals]`.
+ * `[changedRecords, '...', additions, '---', removals]`.
  *
  * For dicts, removed keys appear as `-k: null`, added keys as `+k: v`, and changed keys as
  * `*k: v`. If a changed dict field is itself a compact list diff, that is rendered as
@@ -107,73 +111,134 @@ function writeNoThrow(id: string, _name: string, row: Record<string, unknown>): 
 function delta(prev: unknown, next: unknown): [unknown, boolean] {
   const hash = (v: unknown): string => {
     const sort = (v: unknown): unknown => {
-      if (Array.isArray(v)) return v.map(sort)
-      if (!v || typeof v !== "object") return v
-      return Object.fromEntries(Object.keys(v).sort().map((k) => [k, sort((v as Record<string, unknown>)[k])]))
-    }
+      if (isArray(v)) {
+        return v.map(sort);
+      }
+      if (!v || typeof v !== 'object') {
+        return v;
+      }
+      return Object.fromEntries(
+        Object.keys(v)
+          .sort()
+          .map(k => [k, sort((v as Record<string, unknown>)[k])]),
+      );
+    };
     return createHash("blake2b512").update(JSON.stringify(sort(v))).digest("hex")
-  }
+  };
   if (isRecord(prev) && isRecord(next)) {
-    const out: Record<string, unknown> = {}
-    const pk = new Set(Object.keys(prev))
-    const nk = new Set(Object.keys(next))
-    for (const k of [...pk].filter((k) => !nk.has(k)).sort()) out[`-${k}`] = null
-    for (const k of [...nk].filter((k) => !pk.has(k)).sort()) out[`+${k}`] = next[k]
-    for (const k of [...pk].filter((k) => nk.has(k)).sort()) {
-      const [sub, same] = delta(prev[k], next[k])
+    // RECORDS: Overall resulting record is just {"[repeat]":"[repeat]"} if it's unchanged. This is the only case
+    // where the result has a different structure from the input (well it's still a record, just with keys lost).
+    // Otherwise the result is a record with
+    // - `{"-k":null}` for keys that were in prev but absent in next
+    // - `{"+k":v}` for keys that were absent in prev and present in next
+    // - `{"k":v}` for keys present in both, and v is unchanged in prev and next, and fairly short
+    //    - `{"k":["..."]}` for keys present in both, and v is an unchanged longish array
+    //    - `{"k":{"[unchanged]":"[unchanged]"}}` for keys present in both, and v is an unchanged longish object
+    //    - `{"k":"[unchanged]"}` for keys present in both, and v is an unchanged longish string
+    //    - `{"k":v}` for keys present in both, and v is an unchanged longish anything else
+    // - `{"*k":v}` for keys present in both, and v is a changed non-record non-array
+    // - `{"*k":delta}` for keys present in both, and v is a changed record
+    // - `{"*k":[...v]}` for keys present in both, and v is a changed array best represented as new array, or changes followed by remainder, or changes followed by adds+dels
+    // - `{"k+":[...adds], "k-":[...dels]}` for keys present in both, and v is a changed array best represented just with adds and dels (skip either if absent)
+    let isSame = true;
+    const out: Record<string, unknown> = {};
+    const prevKeys = new Set(Object.keys(prev));
+    const nextKeys = new Set(Object.keys(next));
+    for (const k of [...prevKeys].filter(k => !nextKeys.has(k)).sort()) {
+      out[`-${k}`] = null;
+      isSame = false;
+    }
+    for (const k of [...nextKeys].filter(k => !prevKeys.has(k)).sort()) {
+      out[`+${k}`] = next[k];
+      isSame = false;
+    }
+    for (const k of [...prevKeys].filter(k => nextKeys.has(k)).sort()) {
+      const [sub, same] = delta(prev[k], next[k]);
       if (same) {
-        const raw = JSON.stringify(next[k]) ?? ""
+        const raw = JSON.stringify(next[k]) ?? '';
         out[k] =
           raw.length < 128
             ? next[k]
-            : Array.isArray(next[k])
-              ? ["..."]
+            : isArray(next[k])
+              ? ['...']
               : isRecord(next[k])
-                ? { "[unchanged]": "[unchanged]" }
-                : typeof next[k] === "string"
-                  ? "[unchanged]"
-                  : next[k]
-        continue
+                ? {'[unchanged]': '[unchanged]'}
+                : typeof next[k] === 'string'
+                  ? '[unchanged]'
+                  : next[k];
+        continue;
       }
-      if (!Array.isArray(sub) || (sub[0] !== "..." && sub[0] !== "---")) {
-        out[`*${k}`] = sub
-        continue
+      isSame = false;
+      if (!isArray(sub) || (sub[0] !== '...' && sub[0] !== '---')) {
+        out[`*${k}`] = sub;
+        continue;
       }
-      const cut = sub.findIndex((item) => item === "---")
-      const cut2 = cut === -1 ? undefined : cut
-      const add = cut2 === 0 ? [] : cut2 == null ? sub.slice(1) : sub.slice(1, cut2)
-      const del = cut2 == null ? [] : sub.slice(cut2 + 1)
-      if (del.length > 0) out[`${k}-`] = del
-      if (add.length > 0) out[`${k}+`] = add
+      const cut = sub.findIndex(item => item === '---');
+      const cut2 = cut === -1 ? undefined : cut;
+      const add = cut2 === 0 ? [] : cut2 == null ? sub.slice(1) : sub.slice(1, cut2);
+      const del = cut2 == null ? [] : sub.slice(cut2 + 1);
+      if (del.length > 0) {
+        out[`${k}-`] = del;
+      }
+      if (add.length > 0) {
+        out[`${k}+`] = add;
+      }
     }
-    return Object.keys(out).length === 0 ? [{ "[repeat]": "[repeat]" }, true] : [out, false]
-  }
-  if (Array.isArray(prev) && Array.isArray(next)) {
-    const left: Array<readonly [unknown, string]> = prev.map((v) => [v, hash(v)] as const)
-    let right: Array<readonly [unknown, string]> = next.map((v) => [v, hash(v)] as const)
-    const add: unknown[] = []
-    const del: unknown[] = []
+    return isSame ? [{'[repeat]': '[repeat]'}, true] : [out, false];
+  } else if (isArray(prev) && isArray(next)) {
+    // ARRAYS: Overall resulting array is `[...changedRecordsPrefix, "...", ...adds, "---", ...dels]`
+    // or, if more compact, `[...changedRecordsPrefix, ...nextRemainder]`
+    // - The adds/dels themselves have a greedy algorithm: in prev=[c,d,e,f] next=[d,e,c] then we greedily match c, hence adds=[d,e] and dels=[d,e,f]
+    // - The changedRecordsPrefix deliberately skips identical record elements, just like identical non-array elements get skipped too
+    const changedRecordsPrefix: Array<unknown> = [];
+    let shownEllipsis = false;
+    let i = 0;
+    for (; i < prev.length && i < next.length; i++) {
+      if (!isRecord(prev[i]) || !isRecord(next[i])) {
+        break;
+      }
+      const [elDif, elIsSame] = delta(prev[i], next[i]);
+      if (elIsSame && !shownEllipsis) {
+        changedRecordsPrefix.push('...*');
+        shownEllipsis = true;
+      }
+      if (!elIsSame) {
+        changedRecordsPrefix.push(elDif);
+      }
+    }
+    const left: Array<readonly [unknown, string]> = prev.slice(i).map(v => [v, hash(v)] as const);
+    let right: Array<readonly [unknown, string]> = next.slice(i).map(v => [v, hash(v)] as const);
+    const add: unknown[] = [];
+    const del: unknown[] = [];
     for (const [value, sig] of left) {
-      const ix = right.findIndex((item) => item[1] === sig)
+      const ix = right.findIndex(item => item[1] === sig);
       if (ix === -1) {
-        del.push(value)
-        continue
+        del.push(value);
+        continue;
       }
-      add.push(...right.slice(0, ix).map((item) => item[0]))
-      right = right.slice(ix + 1)
+      add.push(...right.slice(0, ix).map(item => item[0]));
+      right = right.slice(ix + 1);
     }
-    add.push(...right.map((item) => item[0]))
-    if (add.length === 0 && del.length === 0) return [next, true]
-    if (add.length + del.length < next.length) {
+    add.push(...right.map(item => item[0]));
+    if (add.length === 0 && del.length === 0) {
+      return [
+        [...changedRecordsPrefix, ...next.slice(i)],
+        changedRecordsPrefix.length === 0 || (changedRecordsPrefix.length === 1 && shownEllipsis),
+      ];
+    }
+    const additionalEllipsis = shownEllipsis ? [] : ['...'];
+    if (add.length + del.length < next.length - i) {
       return del.length === 0
-        ? [["...", ...add], false]
+        ? [[...changedRecordsPrefix, ...additionalEllipsis, ...add], false]
         : add.length === 0
-          ? [["---", ...del], false]
-          : [["...", ...add, "---", ...del], false]
+          ? [[...changedRecordsPrefix, '---', ...del], false]
+          : [[...changedRecordsPrefix, ...additionalEllipsis, ...add, '---', ...del], false];
     }
-    return [next, false]
+    return [[...changedRecordsPrefix, ...next.slice(i)], false];
+  } else {
+    // PRIMITIVES: Overall resulting primitive is just `next`, the new value itself.
+    return [next, prev === next];
   }
-  return [next, prev === next]
 }
 
 /** Given two objects, returns their shallow merge, else just returns the right-hand side. */
